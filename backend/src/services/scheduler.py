@@ -1,9 +1,9 @@
-import json,logging
-from pathlib import Path
+import logging
 from sqlalchemy import select
 from src.models.entities import Subscription,Receipt,Audit
 from src.services.repository import arrival_rows
 from src.services.digest import calculate
+from src.services.archive import atomic_write,artifact_path
 from src.utils.time import aware,next_due,yesterday
 
 def run_due(s,now):
@@ -21,6 +21,8 @@ def run_due(s,now):
  s.commit()
  for i in sent:
   try:
-   receipt=s.get(Receipt,i);Path('/artifacts/'+str(i)+'.json').write_text(json.dumps(receipt.payload,ensure_ascii=False,indent=2))
+   receipt=s.get(Receipt,i)
+   # 原子写：临时文件 + rename，对账/下载方不会读到半份档案；写失败不影响 DB 回执
+   atomic_write(artifact_path(i),receipt.payload)
   except Exception:logging.exception('DB inbox delivered; optional artifact write failed')
  return sent

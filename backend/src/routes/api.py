@@ -1,6 +1,6 @@
 from fastapi import APIRouter,Depends,HTTPException
 from src.config.database import db
-from src.models.entities import User,Subscription,Receipt,Audit
+from src.models.entities import User,Subscription,Receipt,Audit,ReconBatch,ReconItem
 from src.schemas.business import Login,ArrivalInput,SubscriptionInput,PreviewInput,ReviewInput
 from src.middlewares.auth import current,editor,admin
 from src.utils.security import verify,token
@@ -8,6 +8,7 @@ from src.utils.time import now_utc,yesterday,SH
 from src.services.business import audit,dump
 from src.services.repository import arrival_rows,save_arrival,save_subscription,get_receipt
 from src.services.digest import calculate
+from src.services.archive import start_batch,run_batch,recon_lock
 from src.controllers.business import export_receipt
 router=APIRouter()
 @router.post('/auth/login')
@@ -50,3 +51,19 @@ def review(i:int,data:ReviewInput,u=Depends(admin),s=Depends(db)):
  r.state='reviewed';r.review_note=data.note;s.commit();audit(s,u,'复核晨报回执 '+str(i));return dump(r)
 @router.get('/audits')
 def audits(u=Depends(admin),s=Depends(db)):return [dump(r) for r in s.query(Audit).order_by(Audit.id.desc()).limit(100)]
+@router.get('/reconcile/batches')
+def recon_batches(u=Depends(current),s=Depends(db)):
+ return [dump(b) for b in s.query(ReconBatch).order_by(ReconBatch.id.desc()).all()]
+@router.get('/reconcile/batches/{bid}')
+def recon_batch_detail(bid:int,u=Depends(current),s=Depends(db)):
+ b=s.get(ReconBatch,bid)
+ if not b:raise HTTPException(404,'对账批次不存在')
+ items=s.query(ReconItem).filter_by(batch_id=bid).order_by(ReconItem.id).all()
+ return {'batch':dump(b),'items':[dump(i) for i in items]}
+@router.post('/reconcile/batches')
+def recon_start(u=Depends(admin),s=Depends(db)):
+ # 页面发起即同步结批；与 worker 共用 recon_lock，worker 兜底异步创建/崩溃在途批次。
+ with recon_lock():
+  b=start_batch(s,u.email)
+  run_batch(s,b.id)
+  return dump(s.get(ReconBatch,b.id))

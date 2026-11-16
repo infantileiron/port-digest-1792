@@ -6,7 +6,7 @@
 
 临港联运运营北站、南站和东港三个港站，每天约150条班次记录。现行工作流是值班员导出 `临港到发_20261114.xlsx`，分析员按日期筛选后手算延误，负责人再把表格转发给下一班。痛点是跨午夜班次归错日、未到发被当准点、重复转发后分不清同一口径。上游为港站计划/实际到发记录；本项目替代日界归档、晨报试算和定时分发；下游为站内值班室交接班。
 
-三个核心实体：Arrival到发记录、Subscription晨报订阅、Receipt分发回执，另有用户和审计。四页：到发台账、晨报预览、订阅计划、分发回执。回执支持值班复核与下载，原始记录修订不改变已分发晨报。
+三个核心实体：Arrival到发记录、Subscription晨报订阅、Receipt分发回执，另有用户、审计和归档对账（ReconBatch/ReconItem）。五页：到发台账、晨报预览、订阅计划、分发回执、归档对账。回执支持值班复核与下载，原始记录修订不改变已分发晨报；对账页按回执冻结来源重算并核对共享产物卷，差异逐项留证。
 
 |角色|权限|典型动作|
 |---|---|---|
@@ -46,6 +46,16 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 晨报“送达”表示已提交站内数据库收件箱，不是SMTP邮件。回执保存冻结payload，DB提交后附加写共享产物卷；附加文件失败不影响DB回执和导出。值班复核仅管理员可做，一次复核不可覆盖，且不改变payload。支持单worker；唯一约束与锁防重复，但不声称对外消息的exactly-once。
 
+**归档对账**针对“回执已入箱、共享目录却可能漏写/截断/混入别份晨报”的交接盲区。管理员在归档对账页发起批次（`POST /reconcile/batches`，worker 每秒兜底续跑在途批次），系统按每条回执冻结的 `rows` 重新计算延误统计与 checksum，与回执摘要逐字段比对，并核对共享卷档案：
+
+- 缺档 `missing`：共享目录无档案；坏档 `corrupt`：JSON 截断不可解析；串档 `crossed`：内容不属于本回执（证据中标注 `belongs_to_receipt` 真实归属）。三类回执若冻结来源自洽即可信，问题原件先原子移入 `/artifacts/quarantine`，再按回执 payload 原子补档。
+- 来源自相矛盾 `contradiction`：冻结来源重算结果与回执摘要不一致（如台账改动只动了摘要），不补档、不删档，批次置 `held` 留待人工处理。
+- 孤立文件 `orphan`：共享卷里没有任何回执认领的文件（含 `.tmp` 残留），一律隔离，绝不挂名冒充已送达。
+
+每个差异先落 `recon_items` 证据行并提交，再执行文件移动/补档；处置状态 `pending/ok/repaired/held/quarantined` 是崩溃恢复点，续跑只补未完成动作，重试不重复补档或隔离。补档写到“提交前崩溃”时，续跑校验文件已与 payload 一致则只补记结果、不再移动文件。文件一律临时文件 + `os.replace` 原子落盘，下载只见完整档案。对账与调度使用不同 Redis 锁，扫描期间新回执继续入箱，批次末尾补扫覆盖；同一时刻仅允许一个未结批次（部分唯一索引）。批次状态 `pending→scanning→completed|held`，全部回执与文件均有去向。
+
+容器内可运行 `python -m scripts.drill_reconcile` 演练：自包含 SQLite + 临时目录，覆盖缺/坏/串档补档、矛盾留存、孤立隔离，以及隔离后与补档后两类崩溃的中断恢复；`fakeredis` 不在运行依赖内，演练与本地测试无需 Redis。
+
 ## 工程、环境变量和开发
 
 Python3.11/FastAPI/SQLAlchemy/PyJWT、原生ES modules/CSS、Nginx、PostgreSQL16、Redis7。恰好frontend/backend/worker/db/redis五服务，各有健康检查；backend等db/redis、worker还等backend、frontend等backend。Redis实际提供调度锁；worker心跳 `/tmp/heartbeat`，DB/Redis/产物分别命名卷。Nginx `/api/` 去前缀代理后端根路由。
@@ -54,6 +64,8 @@ Python3.11/FastAPI/SQLAlchemy/PyJWT、原生ES modules/CSS、Nginx、PostgreSQL1
 
 本地开发：启动db/redis，backend安装requirements，设置DATABASE_URL/REDIS_URL/JWT_SECRET，再运行 `uvicorn src.main:app --reload` 和 `python -m src.worker`；前端仍建议用Nginx同源代理。后端目录src按routes/controllers/services/models/schemas/middlewares/config/utils/constants分工；前端src按api/stores/pages/components/hooks/utils/constants/types/router分工。ORM首次建表，migrations保留实际初始DDL，无在线迁移执行器。
 
-枚举：后端 `src/constants/enums.py`、`src/schemas/business.py` 与前端 `src/constants/enums.js` 定义ROLES、STATIONS、RECEIPT_STATES；TIMEZONE固定Asia/Shanghai。共用表格、表单、状态标签、晨报摘要组件；表单hooks、HTML转义和日期工具；请求ID/安全响应头两个中间件，业务审计与全局错误恢复。测试与截图在 `../../test-artifacts/gb-3113/`，不放源码内。
+枚举：后端 `src/constants/enums.py`、`src/schemas/business.py` 与前端 `src/constants/enums.js` 定义ROLES、STATIONS、RECEIPT_STATES、RECON_BATCH_STATES、RECON_FINDINGS、RECON_DISPOSITIONS；TIMEZONE固定Asia/Shanghai。共用表格、表单、状态标签、晨报摘要组件；表单hooks、HTML转义和日期工具；请求ID/安全响应头两个中间件，业务审计与全局错误恢复。测试与截图在 `../../test-artifacts/gb-3113/`，不放源码内。
+
+对账相关表见 `backend/migrations/002_reconcile.sql`（ORM `create_all` 自动建表，迁移文件保留实际DDL）：`recon_batches` 带开放批次部分唯一索引，`recon_items` 以 `(batch_id,receipt_id,artifact_name)` 唯一约束逐项保留差异与处理依据，审计记录发起与结批。
 
 范围：逐条录入/完整修订，无CSV导入、删除或分页；只有三个固定港站与上海时区。站内收件箱按名称记录，当前所有登录角色可读业务回执，无多租户邮箱隔离；不连接邮件、短信或外部IM。Google Fonts离线时字体回退。许可证MIT，见LICENSE。
